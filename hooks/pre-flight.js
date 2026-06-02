@@ -9,20 +9,10 @@
 
 const {
   CFG, shouldSkip, commandCategory, breakerKey, checkHalfOpenTimeout,
-  withLock, loadState, saveState,
+  withLock, loadState, saveState, readStdin,
 } = require('./lib/common');
 
 // ── Main ────────────────────────────────────────────────────────────────────
-
-function main() {
-  const chunks = [];
-  process.stdin.setEncoding('utf8');
-  process.stdin.on('data', c => chunks.push(c));
-  process.stdin.on('end', () => {
-    try { run(JSON.parse(chunks.join(''))); }
-    catch { process.exit(0); }
-  });
-}
 
 function run(event) {
   if (event.tool_name !== 'Bash') { process.exit(0); return; }
@@ -107,4 +97,4 @@ function run(event) {
   });
 }
 
-main();
+readStdin(run);

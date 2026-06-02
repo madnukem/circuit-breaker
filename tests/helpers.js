@@ -26,7 +26,8 @@ function createSuite(prefix) {
       env,
     });
     return {
-      exitCode: result.status || 0,
+      exitCode: result.status != null ? result.status : -1,
+      signal: result.signal,
       stdout: result.stdout || '',
       stderr: result.stderr || '',
     };

@@ -8,7 +8,10 @@ const {
   CFG, CONSEQUENTIAL, shouldSkip, commandCategory, detectFailure,
   applyDecay, checkHalfOpenTimeout, failKey, successKey, breakerKey,
   extractErrorPreview, appendLog, pruneTtl,
-  withLock, loadState, saveState,
+  withLock, loadState, saveState, readStdin,
+  extractMetrics, hasProgress,
+  detectObservabilityGap, recordReadCommand,
+  resetFingerprints, matchesAny,
 } = require('./lib/common');
 
 // ── State Machine Transitions ───────────────────────────────────────────────
@@ -27,41 +30,39 @@ function openBreaker(data, tool, category, reason, count, cmd, errPreview) {
 
 function closeBreaker(data, tool, category) {
   delete data[breakerKey(tool, category)];
-  // Reset failure fingerprints
-  const fpPrefix = `f:${tool}:${category}:`;
-  for (const k of Object.keys(data)) {
-    if (k.startsWith(fpPrefix)) delete data[k];
-  }
+  resetFingerprints(data, tool, category);
   // Reset success counter
   data[successKey(tool, category)] = { count: 0, lastRun: 0, category, cmd: '' };
 }
 
 // ── Main ────────────────────────────────────────────────────────────────────
 
-function main() {
-  const chunks = [];
-  process.stdin.setEncoding('utf8');
-  process.stdin.on('data', c => chunks.push(c));
-  process.stdin.on('end', () => {
-    try { run(JSON.parse(chunks.join(''))); }
-    catch { process.exit(0); }
-  });
-}
-
 function run(event) {
   if (event.tool_name !== 'Bash') { process.exit(0); return; }
 
   const cmd = (event.tool_input && event.tool_input.command) || '';
-  if (!cmd || shouldSkip(cmd)) { process.exit(0); return; }
+  if (!cmd) { process.exit(0); return; }
+
+  const category = commandCategory(cmd);
+  const tool = 'Bash';
+  const now = Date.now();
+
+  // Track read commands for observability gap detection before early return
+  if (shouldSkip(cmd)) {
+    withLock(() => {
+      const data = loadState();
+      recordReadCommand(data, tool, category, now);
+      saveState(data);
+    });
+    process.exit(0);
+    return;
+  }
 
   const output = typeof event.tool_output === 'string'
     ? event.tool_output
     : (event.tool_output ? JSON.stringify(event.tool_output) : '');
 
   const failed = detectFailure(output);
-  const category = commandCategory(cmd);
-  const tool = 'Bash';
-  const now = Date.now();
   const errPreview = failed ? extractErrorPreview(output) : null;
 
   withLock(() => {
@@ -77,7 +78,7 @@ function run(event) {
     // Log decision
     appendLog({
       ts: new Date(now).toISOString(), tool,
-      cmd: cmd.slice(0, 300), ok: !failed, category,
+      cmd, ok: !failed, category,
       ...(failed && errPreview ? { err: errPreview } : {}),
     });
 
@@ -116,6 +117,24 @@ function onFailed(data, tool, category, breaker, cmd, output, errPreview, now) {
   let entry = data[fp];
   if (!entry) entry = { count: 0, lastFail: 0, category, cmd: cmd.slice(0, 100) };
 
+  // Check for numerical progress (e.g., 112→57→11 failing tests)
+  const metricsKey = `metrics:${tool}:${category}`;
+  const currentMetrics = extractMetrics(output);
+  if (currentMetrics) {
+    const prevMetrics = data[metricsKey];
+    if (prevMetrics && hasProgress(prevMetrics, currentMetrics)) {
+      // Progress detected — log but don't increment counter
+      data[metricsKey] = currentMetrics;
+      saveState(data);
+      process.stderr.write(
+        `[BREAKER] Progress detected for "${category}": metrics improving. Counter not incremented.\n`
+      );
+      process.exit(0);
+      return;
+    }
+    data[metricsKey] = currentMetrics;
+  }
+
   applyDecay(entry, now);
   entry.count++;
   entry.lastFail = now;
@@ -141,10 +160,14 @@ function onFailed(data, tool, category, breaker, cmd, output, errPreview, now) {
     return;
   }
 
+  const gapDetected = detectObservabilityGap(data, tool, category, now);
   if (entry.count === CFG.failThreshold - 1) {
+    const gapMsg = gapDetected
+      ? '\n[BREAKER HINT] No read/debug commands between retries. Add observability before retrying.'
+      : '';
     process.stderr.write(
       `[BREAKER WARNING] "${category}" failed ${entry.count}/${CFG.failThreshold}. ` +
-      `One more failure will trip the breaker.\n`
+      `One more failure will trip the breaker.${gapMsg}\n`
     );
   }
 
@@ -167,16 +190,10 @@ function onSuccess(data, tool, category, breaker, cmd, now) {
   }
 
   // Reset failure fingerprints on success
-  const fpPrefix = `f:${tool}:${category}:`;
-  for (const k of Object.keys(data)) {
-    if (k.startsWith(fpPrefix)) delete data[k];
-  }
+  resetFingerprints(data, tool, category);
 
   // Suspicious success for consequential commands
-  let isConseq = false;
-  for (let i = 0; i < CONSEQUENTIAL.length; i++) {
-    if (CONSEQUENTIAL[i].test(cmd)) { isConseq = true; break; }
-  }
+  const isConseq = matchesAny(cmd, CONSEQUENTIAL);
 
   if (isConseq) {
     const sfp = successKey(tool, cmd);
@@ -190,14 +207,18 @@ function onSuccess(data, tool, category, breaker, cmd, now) {
     data[sfp] = sEntry;
 
     if (sEntry.count >= CFG.successThreshold && (!breaker || breaker.status === 'closed')) {
+      const gap = detectObservabilityGap(data, tool, category, now);
       openBreaker(data, tool, category, 'suspicious-success', sEntry.count, cmd, null);
       saveState(data);
+      const gapHint = gap
+        ? '\nNo read/debug commands between retries. Add logging, read output files, or check runtime state.'
+        : '';
       process.stderr.write([
         '',
         '=== CIRCUIT BREAKER: SUSPICIOUS SUCCESS ===',
         '',
         `"${category}" has been run ${sEntry.count} times with exit 0.`,
-        `Breaker is now OPEN. Before rerunning, add observability.`,
+        `Breaker is now OPEN. Before rerunning, add observability.${gapHint}`,
         '===========================================',
         '',
       ].join('\n'));
@@ -210,4 +231,4 @@ function onSuccess(data, tool, category, breaker, cmd, now) {
   process.exit(0);
 }
 
-main();
+readStdin(run);

@@ -103,9 +103,12 @@ const SECRET_PATTERNS = [
 function sanitizeCmd(cmd) {
   let s = cmd;
   for (const re of SECRET_PATTERNS) {
-    s = s.replace(re, (match) => {
-      // For URL creds: keep protocol, redact user:pass
-      if (match.includes('://')) return '://***@';
+    const global = new RegExp(re.source, 'gi');
+    s = s.replace(global, (match) => {
+      if (match.includes('://')) {
+        const proto = match.match(/^(\w+):\/\//);
+        return proto ? proto[1] + '://***@' : '://***@';
+      }
       return match.slice(0, Math.min(match.indexOf(' ') + 1, 8)) + '***';
     });
   }
@@ -164,8 +167,21 @@ function saveState(data) {
 
 function withLock(fn) {
   const locked = acquireLock();
+  if (!locked) {
+    process.stderr.write('[BREAKER WARNING] Failed to acquire lock — proceeding without exclusive access.\n');
+  }
   try { return fn(); }
   finally { if (locked) releaseLock(); }
+}
+
+function readStdin(cb) {
+  const chunks = [];
+  process.stdin.setEncoding('utf8');
+  process.stdin.on('data', c => chunks.push(c));
+  process.stdin.on('end', () => {
+    try { cb(JSON.parse(chunks.join(''))); }
+    catch { process.exit(0); }
+  });
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -177,19 +193,16 @@ function commandCategory(cmd) {
   return parts.slice(i, i + 3).join(' ').slice(0, 80);
 }
 
-function shouldSkip(cmd) {
-  for (let i = 0; i < SKIP.length; i++) {
-    if (SKIP[i].test(cmd)) return true;
+function matchesAny(str, patterns) {
+  for (let i = 0; i < patterns.length; i++) {
+    if (patterns[i].test(str)) return true;
   }
   return false;
 }
 
-function detectFailure(output) {
-  for (let i = 0; i < FAILURE_SIGNALS.length; i++) {
-    if (FAILURE_SIGNALS[i].test(output)) return true;
-  }
-  return false;
-}
+function shouldSkip(cmd) { return matchesAny(cmd, SKIP); }
+
+function detectFailure(output) { return matchesAny(output, FAILURE_SIGNALS); }
 
 function applyDecay(entry, now) {
   if (entry.count <= 0) return;
@@ -198,7 +211,6 @@ function applyDecay(entry, now) {
   const halfLives = (now - last) / CFG.decayMs;
   if (halfLives >= 1) {
     entry.count = Math.floor(entry.count * Math.pow(0.5, halfLives));
-    if (entry.count <= 0) entry.count = 0;
   }
 }
 
@@ -211,6 +223,263 @@ function checkHalfOpenTimeout(breaker, now) {
   }
   return false;
 }
+
+// ── Observability Gap Detection ───────────────────────────────────────────────
+
+function detectObservabilityGap(data, tool, category, now) {
+  const key = `obs:${tool}:${category}`;
+  const info = data[key] || { runCount: 0, hasRead: false, lastUpdate: 0 };
+
+  // Reset after 10 minutes
+  if (now - info.lastUpdate > 10 * 60 * 1000) {
+    info.runCount = 0;
+    info.hasRead = false;
+  }
+
+  info.runCount++;
+  info.lastUpdate = now;
+  data[key] = info;
+
+  return info.runCount >= 3 && !info.hasRead;
+}
+
+function recordReadCommand(data, tool, category, now) {
+  const key = `obs:${tool}:${category}`;
+  const info = data[key];
+  if (info) info.hasRead = true;
+}
+
+// ── Progress Detection ────────────────────────────────────────────────────────
+
+const PROGRESS_PATTERNS = [
+  { key: 'failing', re: /(\d+)\s+(?:tests?\s+)?(?:fail|failures?|failing)/i, direction: -1 },
+  { key: 'passing', re: /(\d+)\s+(?:tests?\s+)?(?:pass|passed|passing)/i, direction: 1 },
+  { key: 'errors', re: /(\d+)\s+(?:error|errors)/i, direction: -1 },
+  { key: 'warnings', re: /(\d+)\s+(?:warning|warnings)/i, direction: -1 },
+  { key: 'coverage', re: /(\d+)(?:\.\d+)?%\s*(?:coverage|covered)/i, direction: 1 },
+  { key: 'complete', re: /(\d+)(?:\.\d+)?%\s*(?:complete|done|finished)/i, direction: 1 },
+];
+
+function extractMetrics(output) {
+  const m = {};
+  for (const { key, re } of PROGRESS_PATTERNS) {
+    const match = re.exec(output);
+    if (match) m[key] = parseInt(match[1], 10);
+  }
+  return Object.keys(m).length > 0 ? m : null;
+}
+
+function hasProgress(prev, curr) {
+  if (!prev || !curr) return false;
+  let improved = 0, degraded = 0;
+  for (const { key, direction } of PROGRESS_PATTERNS) {
+    if (prev[key] != null && curr[key] != null) {
+      const delta = (curr[key] - prev[key]) * direction;
+      if (delta > 0) improved += delta;
+      else if (delta < 0) degraded += Math.abs(delta);
+    }
+  }
+  return improved > degraded && improved > 0;
+}
+
+// ── Semantic Error Classification ─────────────────────────────────────────────
+
+const DEFAULT_ERROR_CLASSES = {
+  DEPENDENCY_MISSING: [
+    /\b(?:cannot|could not)\s+find\s+(?:module|package)\b/i,
+    /\bmodule\s+not\s+found\b/i,
+    /\bpackage\s+['"]?\w+['"]?\s+(?:is\s+)?not\s+(?:found|installed|defined)\b/i,
+    /\bcannot\s+resolve\s+(?:dependency|module|package)\b/i,
+    /\bno\s+matching\s+version\s+found\b/i,
+    /\bmissing\s+(?:dependency|module|package|peer)\b/i,
+    /\bERR_MODULE_NOT_FOUND\b/,
+    /\bMODULE_NOT_FOUND\b/,
+    /\b(?:npm|yarn|pnpm)\s+ERR!\s+404\b/,
+    /\bModuleNotFoundError\b/,
+    /\bcargo:.+no\s+matching\s+package\s+named\b/i,
+    /\bgem\s+not\s+found\b/i,
+  ],
+  DEPENDENCY_VERSION: [
+    /\bERESOLVE\b.*\b(?:overriding|peer\s+dep|conflicting)/i,
+    /\bpeer\s+dependency\s+(?:conflict|mismatch)\b/i,
+    /\bversion\s+(?:conflict|mismatch|incompatib)\b/i,
+    /\bincompatible\s+(?:with|version)\b/i,
+    /\b(?:npm|yarn)\s+ERR!\s+ERESOLVE\b/,
+    /\b(?:requires|expected)\s+\S+\s+but\s+(?:got|have|is)\s+/i,
+  ],
+  TYPE_ERROR: [
+    /\b(?:TypeError|TypeError)\b/,
+    /\b(?:Cannot|can't)\s+(?:read|set|assign)\s+(?:properties\s+)?of\s+(?:undefined|null)/i,
+    /\bundefined\s+is\s+not\s+(?:a\s+)?function\b/i,
+    /\b(?:is|are)\s+not\s+(?:a\s+)?(?:function|iterable|callable)\b/i,
+    /\bAttributeError\b/,
+    /\bClassCastException\b/,
+    /\bInvalidCastException\b/,
+    /\btype\s*mismatch\b/i,
+  ],
+  SYNTAX_ERROR: [
+    /\bSyntaxError\b/,
+    /\b(?:Unexpected|expected)\s+(?:token|end|identifier|string|number)/i,
+    /\bparse\s+error\b/i,
+    /\bIndentationError\b/,
+    /\bTabError\b/,
+    /\bcannot find symbol\b/i,
+    /\billegal\s+(?:start\s+of\s+)?expression\b/i,
+    /\bunclosed\s+(?:string|literal|parenthes|bracket|brace)\b/i,
+  ],
+  PERMISSION_DENIED: [
+    /\b(?:permission|access)\s+denied\b/i,
+    /\bEACCES\b/,
+    /\bEPERM\b/,
+    /\bOperation\s+not\s+permitted\b/i,
+    /\b(?:chown|chmod|chgrp).*failed\b/i,
+    /\bsudo.*required\b/i,
+  ],
+  FILE_NOT_FOUND: [
+    /\b(?:no\s+such\s+file|file\s+not\s+found|cannot\s+find)\b/i,
+    /\bENOENT\b/,
+    /\bpath\s+does\s+not\s+exist\b/i,
+    /\bdirectory\s+not\s+(?:found|empty)\b/i,
+    /\b(?:Cannot|can't)\s+open\s+(?:file|dir)/i,
+  ],
+  NETWORK_ERROR: [
+    /\b(?:connection|network)\s+(?:refused|reset|timed?\s?out|failed)\b/i,
+    /\bECONNREFUSED\b/,
+    /\bECONNRESET\b/,
+    /\bENETUNREACH\b/,
+    /\bEHOSTUNREACH\b/,
+    /\bEAI_AGAIN\b/,
+    /\bDNS\s*(?:error|failure|resolution\s+failed)\b/i,
+    /\b(?:socket|request)\s+(?:hang\s+up|closed|aborted)\b/i,
+    /\bSSL.*(?:error|handshake|certificate)\b/i,
+    /\bcurl.*\(\d+\)\s/i,
+  ],
+  BUILD_FAILED: [
+    /\bBUILD\s+(?:FAILED|FAILURE)\b/i,
+    /\bcompilation\s+(?:failed|error)\b/i,
+    /\b(?:failed\s+to\s+)?compile\b/i,
+    /\b(?:webpack|rollup|vite|esbuild|babel).*error\b/i,
+    /\b(?:cargo|rustc)\s+error\b/i,
+    /\b(?:make|cmake|bazel).*error\b/i,
+    /\blinker\s+error\b/i,
+    /\bld\s+returned\b/i,
+  ],
+  TEST_FAILED: [
+    /\b(?:test|tests|spec|specs|scenario)\s*\d*\s*(?:fail|failure|error)/i,
+    /\bFAIL(?:ED|URE)?\s+(?:\d+|test|spec)/i,
+    /\bassert(?:ion)?\s*(?:failed|error|Failure)\b/i,
+    /\bexpected.*but\s+(?:got|was|received)/i,
+    /\b(?:jest|mocha|pytest|junit|cypress|playwright|karma).*fail/i,
+    /\b(?:RSpec|rspec).*(?:fail|error)/i,
+    /\bTests\s+run:.*Failures:\s*[1-9]/i,
+  ],
+  CONFIG_ERROR: [
+    /\bconfig(?:uration)?\s*(?:error|invalid|missing|parse)\b/i,
+    /\bmissing\s+(?:env|environment)\s+(?:variable|var)\b/i,
+    /\b\.env\b.*(?:missing|not\s+found|error)/i,
+    /\binvalid\s+config/i,
+    /\bunknown\s+option\s+['"]-/i,
+    /\bunsupported\s+(?:option|flag|parameter|config)\b/i,
+    /\byaml\s+(?:parse|syntax)\s*error\b/i,
+    /\bjson\s+(?:parse|syntax)\s*error\b/i,
+    /\btoml\s+(?:parse|syntax)\s*error\b/i,
+  ],
+  RESOURCE_EXHAUSTED: [
+    /\b(?:out\s+of\s+memory|OOM|OutOfMemory|heap\s+space)\b/i,
+    /\bdisk\s+(?:full|space)\b/i,
+    /\bENOSPC\b/,
+    /\btoo\s+many\s+(?:open\s+files|connections|processes)\b/i,
+    /\bEMFILE\b/,
+    /\bENFILE\b/,
+    /\bresource\s+(?:exhausted|limit|unavailable)\b/i,
+    /\bquota\s+(?:exceeded|reached)\b/i,
+  ],
+  RUNTIME_CRASH: [
+    /\b(?:segfault|segmentation\s+fault|core\s+dumped)\b/i,
+    /\b(?:abort|aborting|SIGABRT)\b/i,
+    /\b(?:killed|SIGKILL)\b/i,
+    /\b(?:stack\s+overflow|StackOverflowError)\b/i,
+    /\b(?:panic|panicked)\b/,
+    /\b(?:illegal|invalid)\s+instruction\b/i,
+    /\bexit\s+code\s+(?:1[2-9][0-9]|139|137|134)\b/,
+  ],
+  AUTH_ERROR: [
+    /\b(?:401|403|Unauthorized|Forbidden)\b/,
+    /\b(?:authentication|authorization)\s+(?:failed|error|required)\b/i,
+    /\b(?:invalid|expired|missing)\s+(?:token|api\s*key|credential|secret)\b/i,
+    /\b(?:Bearer|JWT|OAuth).*(?:invalid|expired|missing)\b/i,
+    /\baccess\s+token\s+(?:expired|invalid|revoked)\b/i,
+    /\blogin\s+(?:failed|required|again)\b/i,
+  ],
+  RATE_LIMIT: [
+    /\b429\b/,
+    /\brate\s+limit/i,
+    /\btoo\s+many\s+requests\b/i,
+    /\bquota\s+exceeded\b/i,
+    /\bthrottl(?:ed|ing)\b/i,
+    /\bAPI\s+(?:rate|usage)\s+limit\b/i,
+    /\bretry\s+after\b/i,
+  ],
+  TIMEOUT: [
+    /\b(?:timed?\s?out|timeout)\b/i,
+    /\bETIMEDOUT\b/,
+    /\bdeadline\s+exceeded\b/i,
+    /\b(?:operation|request|connection|query)\s+timed?\s?out\b/i,
+    /\b(?:exceeded|surpassed)\s+(?:the\s+)?time\s+limit\b/i,
+  ],
+  PORT_CONFLICT: [
+    /\b(?:address\s+already\s+in\s+use|port.*(?:already|in\s+use|occupied|bound))\b/i,
+    /\bEADDRINUSE\b/,
+    /\b(?:bind|listen)\s*(?:failed|error).*\b(?:port|address)\b/i,
+  ],
+};
+
+function loadCustomErrorClasses() {
+  const p = paths();
+  const customPath = path.join(p.CLAUDE_DIR, 'error-classes.json');
+  let custom;
+  try { custom = JSON.parse(fs.readFileSync(customPath, 'utf8')); } catch (e) {
+    if (e.code !== 'ENOENT') {
+      process.stderr.write(`[BREAKER WARNING] Failed to load ${customPath}: ${e.message}\n`);
+    }
+    return null;
+  }
+  return custom;
+}
+
+function buildErrorClasses() {
+  const classes = {};
+  for (const [name, patterns] of Object.entries(DEFAULT_ERROR_CLASSES)) {
+    classes[name] = patterns.map(p => typeof p === 'string' ? new RegExp(p, 'i') : p);
+  }
+  const custom = loadCustomErrorClasses();
+  if (!custom) return classes;
+  for (const [name, def] of Object.entries(custom)) {
+    if (def.disabled) { delete classes[name]; continue; }
+    if (def.override && def.patterns) {
+      classes[name] = def.patterns.map(p => new RegExp(p, 'i'));
+    } else if (def.patterns) {
+      classes[name] = [...(classes[name] || []), ...def.patterns.map(p => new RegExp(p, 'i'))];
+    }
+  }
+  return classes;
+}
+
+let _errorClasses = null;
+function getErrorClasses() {
+  if (!_errorClasses) _errorClasses = buildErrorClasses();
+  return _errorClasses;
+}
+
+function classifyError(output) {
+  const classes = getErrorClasses();
+  for (const [name, patterns] of Object.entries(classes)) {
+    if (matchesAny(output, patterns)) return name;
+  }
+  return 'UNKNOWN';
+}
+
+// ── Error Normalization ──────────────────────────────────────────────────────
 
 function normalizeError(output) {
   const lines = output.split('\n');
@@ -230,9 +499,14 @@ function normalizeError(output) {
 }
 
 function failKey(tool, cmd, output) {
-  return `f:${tool}:${commandCategory(cmd)}:${normalizeError(output)}`;
+  const cls = classifyError(output);
+  const suffix = cls !== 'UNKNOWN' ? cls : normalizeError(output);
+  return `f:${tool}:${commandCategory(cmd)}:${suffix}`;
 }
 
+// Category-based key — all consequential commands in the same category share one counter.
+// Intentional: "npm run test:unit" and "npm run test:e2e" both count toward the
+// same suspicious-success threshold, preventing the agent from cycling through variants.
 function successKey(tool, cmd) {
   return `s:${tool}:${commandCategory(cmd)}`;
 }
@@ -251,11 +525,17 @@ function extractErrorPreview(output) {
     .join(' | ').slice(0, 500);
 }
 
+function resetFingerprints(data, tool, category) {
+  const fpPrefix = `f:${tool}:${category}:`;
+  for (const k of Object.keys(data)) {
+    if (k.startsWith(fpPrefix)) delete data[k];
+  }
+}
+
 function appendLog(entry) {
   const p = paths();
   try { if (fs.statSync(p.LOG_FILE).size > CFG.maxLogBytes) rotateLog(); } catch {}
-  // Sanitize command before logging
-  if (entry.cmd) entry.cmd = sanitizeCmd(entry.cmd);
+  if (entry.cmd) entry.cmd = sanitizeCmd(entry.cmd).slice(0, 300);
   try { fs.appendFileSync(p.LOG_FILE, JSON.stringify(entry) + '\n'); } catch {}
 }
 
@@ -278,7 +558,7 @@ function pruneTtl(data) {
   const cutoff = Date.now() - CFG.ttlMs;
   for (const k of Object.keys(data)) {
     const e = data[k];
-    const last = e.lastFail || e.lastRun || e.since || 0;
+    const last = e.lastFail || e.lastRun || e.since || e.lastUpdate || 0;
     if (last > 0 && last < cutoff) { delete data[k]; }
   }
 }
@@ -289,10 +569,13 @@ module.exports = {
   paths,
   CFG,
   SKIP, CONSEQUENTIAL, FAILURE_SIGNALS, ERROR_LINE_RE,
-  acquireLock, releaseLock, withLock,
+  acquireLock, releaseLock, withLock, readStdin,
   loadState, saveState,
-  commandCategory, shouldSkip, detectFailure, applyDecay, checkHalfOpenTimeout,
+  matchesAny, commandCategory, shouldSkip, detectFailure, applyDecay, checkHalfOpenTimeout,
   normalizeError, failKey, successKey, breakerKey,
-  extractErrorPreview, appendLog, rotateLog, pruneTtl,
+  extractErrorPreview, resetFingerprints, appendLog, rotateLog, pruneTtl,
   sanitizeCmd,
+  classifyError, getErrorClasses,
+  extractMetrics, hasProgress,
+  detectObservabilityGap, recordReadCommand,
 };
