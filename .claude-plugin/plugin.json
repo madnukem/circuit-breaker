@@ -1,0 +1,12 @@
+{
+  "name": "circuit-breaker",
+  "description": "Circuit breaker hook for Claude Code — detects failure loops and suspicious success patterns, forces model to step back and change approach",
+  "version": "1.0.0",
+  "author": {
+    "name": "Vassa"
+  },
+  "homepage": "https://github.com/<owner>/circuit-breaker",
+  "repository": "https://github.com/<owner>/circuit-breaker",
+  "license": "MIT",
+  "keywords": ["claude-code", "circuit-breaker", "hooks", "debugging", "loop-detection", "decision-logging"]
+}

@@ -1,0 +1,7 @@
+node_modules/
+*.lock
+.claude/breaker-state.json
+.claude/breaker-state.json.tmp
+.claude/breaker-state.json.lock
+.claude/decision-log.jsonl
+.claude/decision-log.*.jsonl

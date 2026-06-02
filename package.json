@@ -1,0 +1,15 @@
+{
+  "name": "circuit-breaker",
+  "version": "1.0.0",
+  "description": "Circuit breaker hook for Claude Code — detects failure loops and suspicious success patterns",
+  "author": "Vassa",
+  "license": "MIT",
+  "keywords": ["claude-code", "circuit-breaker", "hooks", "loop-detection", "decision-logging"],
+  "scripts": {
+    "test": "node tests/base.test.js && node tests/edge.test.js && node tests/regression.test.js && node tests/state-machine.test.js",
+    "test:base": "node tests/base.test.js",
+    "test:edge": "node tests/edge.test.js",
+    "test:regression": "node tests/regression.test.js",
+    "test:sm": "node tests/state-machine.test.js"
+  }
+}

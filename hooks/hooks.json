@@ -1,0 +1,28 @@
+{
+  "PreToolUse": [
+    {
+      "matcher": "Bash",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "node hooks/pre-flight.js"
+        }
+      ],
+      "description": "Pre-flight check: block commands when breaker is OPEN, allow one probe in HALF-OPEN",
+      "id": "pre:bash:pre-flight"
+    }
+  ],
+  "PostToolUse": [
+    {
+      "matcher": "Bash",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "node hooks/circuit-breaker.js"
+        }
+      ],
+      "description": "Circuit breaker: detect failure loops and suspicious success patterns",
+      "id": "post:bash:circuit-breaker"
+    }
+  ]
+}
