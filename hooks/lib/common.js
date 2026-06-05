@@ -563,6 +563,28 @@ function pruneTtl(data) {
   }
 }
 
+// ── Remote Command Stripping ──────────────────────────────────────────────────
+
+// SSH/SCP commands carry remote commands as arguments. Those should not trigger
+// CONSEQUENTIAL pattern matching (e.g. "deploy" inside ssh user@host "deploy app").
+const REMOTE_COMMAND_RE = /^\s*(?:ssh|scp|sftp|rsync)\b/i;
+
+function stripRemoteCommand(cmd) {
+  if (!REMOTE_COMMAND_RE.test(cmd)) return cmd;
+  // For SSH: everything after the host argument is the remote command.
+  // Find the host (first token without dashes that contains @ or is a bare hostname),
+  // then strip everything after it.
+  const parts = cmd.split(/\s+/);
+  let hostIdx = -1;
+  for (let i = 1; i < parts.length; i++) {
+    if (parts[i].startsWith('-')) continue;
+    hostIdx = i;
+    break;
+  }
+  if (hostIdx < 0) return cmd;
+  return parts.slice(0, hostIdx + 1).join(' ');
+}
+
 // ── Exports ───────────────────────────────────────────────────────────────────
 
 module.exports = {
@@ -575,6 +597,7 @@ module.exports = {
   normalizeError, failKey, successKey, breakerKey,
   extractErrorPreview, resetFingerprints, appendLog, rotateLog, pruneTtl,
   sanitizeCmd,
+  stripRemoteCommand,
   classifyError, getErrorClasses,
   extractMetrics, hasProgress,
   detectObservabilityGap, recordReadCommand,

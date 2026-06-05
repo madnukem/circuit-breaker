@@ -558,7 +558,8 @@ test('circuit-breaker uses resetFingerprints helper', () => {
 
 test('circuit-breaker uses matchesAny for consequential check', () => {
   const cbSrc = fs.readFileSync(path.join(__dirname, '..', 'hooks', 'circuit-breaker.js'), 'utf8');
-  assert(cbSrc.includes('matchesAny(cmd, CONSEQUENTIAL)'), `Should use matchesAny for consequential`);
+  assert(cbSrc.includes('stripRemoteCommand('), `Should strip remote commands before consequential check`);
+  assert(cbSrc.includes('matchesAny(cmdForConseq, CONSEQUENTIAL)'), `Should use matchesAny for consequential`);
   // Should NOT have inline for-loop over CONSEQUENTIAL
   assert(!cbSrc.includes('CONSEQUENTIAL.length'), `Should not iterate CONSEQUENTIAL manually`);
 });

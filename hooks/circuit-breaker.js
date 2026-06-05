@@ -11,7 +11,7 @@ const {
   withLock, loadState, saveState, readStdin,
   extractMetrics, hasProgress,
   detectObservabilityGap, recordReadCommand,
-  resetFingerprints, matchesAny,
+  resetFingerprints, matchesAny, stripRemoteCommand,
 } = require('./lib/common');
 
 // ── State Machine Transitions ───────────────────────────────────────────────
@@ -193,7 +193,8 @@ function onSuccess(data, tool, category, breaker, cmd, now) {
   resetFingerprints(data, tool, category);
 
   // Suspicious success for consequential commands
-  const isConseq = matchesAny(cmd, CONSEQUENTIAL);
+  const cmdForConseq = stripRemoteCommand(cmd);
+  const isConseq = matchesAny(cmdForConseq, CONSEQUENTIAL);
 
   if (isConseq) {
     const sfp = successKey(tool, cmd);
