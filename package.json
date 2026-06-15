@@ -6,10 +6,19 @@
   "license": "MIT",
   "keywords": ["claude-code", "circuit-breaker", "hooks", "loop-detection", "decision-logging"],
   "scripts": {
-    "test": "node tests/base.test.js && node tests/edge.test.js && node tests/regression.test.js && node tests/state-machine.test.js",
+    "test": "node tests/base.test.js && node tests/edge.test.js && node tests/regression.test.js && node tests/state-machine.test.js && node tests/payload.test.js",
     "test:base": "node tests/base.test.js",
     "test:edge": "node tests/edge.test.js",
     "test:regression": "node tests/regression.test.js",
-    "test:sm": "node tests/state-machine.test.js"
-  }
+    "test:sm": "node tests/state-machine.test.js",
+    "test:payload": "node tests/payload.test.js"
+  },
+  "files": [
+    ".claude-plugin",
+    "hooks",
+    "skills",
+    "README.md",
+    "LICENSE",
+    "package.json"
+  ]
 }
